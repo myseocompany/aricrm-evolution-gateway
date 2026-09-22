@@ -1,0 +1,19 @@
+{$GATEWAY_DOMAIN} {
+	encode zstd gzip
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy gateway:8080
+	log {
+		output stdout
+		format filter {
+			request>headers>X-Gateway-Token delete
+			request>headers>X-Gateway-Metrics-Token delete
+			request>headers>Apikey delete
+			request>uri query {
+				delete token
+			}
+			wrap json
+		}
+	}
+}
