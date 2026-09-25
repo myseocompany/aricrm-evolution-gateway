@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "test": "node --import tsx --test test/core.test.ts",
+    "test": "node --import tsx --test test/core.test.ts test/egress.test.ts",
     "test:integration": "node --import tsx --test test/integration.test.ts",
     "test:all": "npm test && npm run test:integration",
     "typecheck": "tsc -p tsconfig.json --noEmit"

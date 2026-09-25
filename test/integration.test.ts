@@ -6,7 +6,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 
 const execFile = promisify(execFileCallback);
-const execDocker = async (...args: string[]) => (await execFile('docker', args, {encoding: 'utf8'})).stdout.trim();
+const execDocker = async (...args: string[]) => (await execFile('docker', args, { encoding: 'utf8' })).stdout.trim();
 const ingressToken = 'integration-ingress-token-1234567890';
 const metricsToken = 'integration-metrics-token-1234567890';
 const root = new URL('..', import.meta.url).pathname;
@@ -19,7 +19,7 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs = 15_000): Promi
 }
 async function freePort(): Promise<number> {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const port = (server.address() as {port: number}).port; server.close(); return port;
+  const port = (server.address() as { port: number }).port; server.close(); return port;
 }
 async function stop(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null) return;
@@ -32,7 +32,7 @@ async function startGateway(port: number, databaseUrl: string, targetUrl: string
   let output = '';
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
     cwd: root,
-    env: {...process.env, PORT: String(port), DATABASE_URL: databaseUrl, TARGET_URL: targetUrl, INGRESS_TOKEN: ingressToken, METRICS_TOKEN: metricsToken, TARGET_TIMEOUT_SECONDS: '1', WORKERS: '1', MAX_ATTEMPTS: '3'},
+    env: { ...process.env, PORT: String(port), DATABASE_URL: databaseUrl, TARGET_URL: targetUrl, INGRESS_TOKEN: ingressToken, METRICS_TOKEN: metricsToken, EGRESS_USER_AGENT: 'integration-test/1.0', TARGET_TIMEOUT_SECONDS: '1', WORKERS: '1', MAX_ATTEMPTS: '3' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout?.on('data', data => { output += data; }); child.stderr?.on('data', data => { output += data; });
@@ -43,11 +43,11 @@ async function startGateway(port: number, databaseUrl: string, targetUrl: string
       catch { return false; }
     });
   }
-  catch (error) { await stop(child); throw new Error(`gateway did not start: ${output}`, {cause: error}); }
-  return {child, baseUrl, output: () => output};
+  catch (error) { await stop(child); throw new Error(`gateway did not start: ${output}`, { cause: error }); }
+  return { child, baseUrl, output: () => output };
 }
 
-test('integration: transparent durable failure policies', {timeout: 60_000}, async (t) => {
+test('integration: transparent durable failure policies', { timeout: 60_000 }, async (t) => {
   try { await execDocker('version', '--format', '{{.Server.Version}}'); }
   catch { t.skip('Docker is required for PostgreSQL integration tests'); return; }
 
@@ -68,7 +68,7 @@ test('integration: transparent durable failure policies', {timeout: 60_000}, asy
     const databaseUrl = `postgres://gateway:gateway-test-password@127.0.0.1:${postgresPort}/gateway`;
     target = createServer(async (request, response) => {
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {data?: {scenario?: string}};
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { data?: { scenario?: string } };
       const scenario = body.data?.scenario ?? 'default'; const count = (hits.get(scenario) ?? 0) + 1; hits.set(scenario, count);
       if (scenario === 'retry' && count === 1) return void response.writeHead(503).end('{}');
       if (scenario === 'timeout' && count === 1) return void setTimeout(() => response.writeHead(200).end('{}'), 1_500);
@@ -78,15 +78,15 @@ test('integration: transparent durable failure policies', {timeout: 60_000}, asy
       response.writeHead(200).end('{}');
     });
     target.listen(0, '127.0.0.1'); await once(target, 'listening');
-    const targetUrl = `http://127.0.0.1:${(target.address() as {port:number}).port}`;
+    const targetUrl = `http://127.0.0.1:${(target.address() as { port: number }).port}`;
     gateway = await startGateway(await freePort(), databaseUrl, targetUrl);
     const send = async (scenario: string) => {
-      const response = await fetch(`${gateway!.baseUrl}/v1/evolution`, {method: 'POST', headers: {'content-type': 'application/json', 'x-gateway-token': ingressToken}, body: JSON.stringify({event: 'messages.upsert', instance: 'integration-line', data: {key: {id: scenario}, scenario}})});
-      assert.equal(response.status, 200); return response.json() as Promise<{id: string}>;
+      const response = await fetch(`${gateway!.baseUrl}/v1/evolution`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-gateway-token': ingressToken }, body: JSON.stringify({ event: 'messages.upsert', instance: 'integration-line', data: { key: { id: scenario }, scenario } }) });
+      assert.equal(response.status, 200); return response.json() as Promise<{ id: string }>;
     };
     const metrics = async () => {
-      const response = await fetch(`${gateway!.baseUrl}/metrics`, {headers: {'x-gateway-metrics-token': metricsToken}});
-      assert.equal(response.status, 200); return response.json() as Promise<{events: Record<string, number>; circuitOpen: boolean; pendingAgeSeconds: number}>;
+      const response = await fetch(`${gateway!.baseUrl}/metrics`, { headers: { 'x-gateway-metrics-token': metricsToken } });
+      assert.equal(response.status, 200); return response.json() as Promise<{ events: Record<string, number>; circuitOpen: boolean; pendingAgeSeconds: number; avgLatencyMs: number }>;
     };
     assert.equal((await fetch(`${gateway.baseUrl}/metrics`)).status, 401, 'metrics must be token-protected');
     const a = await send('duplicate'); const b = await send('duplicate'); assert.equal(a.id, b.id, 'same payload is one durable event');
