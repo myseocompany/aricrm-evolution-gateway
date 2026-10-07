@@ -28,11 +28,11 @@ async function stop(child: ChildProcess): Promise<void> {
   if (child.exitCode === null) child.kill('SIGKILL');
 }
 type Gateway = { child: ChildProcess; baseUrl: string; output: () => string };
-async function startGateway(port: number, databaseUrl: string, targetUrl: string): Promise<Gateway> {
+async function startGateway(port: number, databaseUrl: string, targetUrl: string, workers = 1): Promise<Gateway> {
   let output = '';
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), DATABASE_URL: databaseUrl, TARGET_URL: targetUrl, INGRESS_TOKEN: ingressToken, METRICS_TOKEN: metricsToken, EGRESS_USER_AGENT: 'integration-test/1.0', TARGET_TIMEOUT_SECONDS: '1', WORKERS: '1', MAX_ATTEMPTS: '3' },
+    env: { ...process.env, PORT: String(port), DATABASE_URL: databaseUrl, TARGET_URL: targetUrl, INGRESS_TOKEN: ingressToken, METRICS_TOKEN: metricsToken, EGRESS_USER_AGENT: 'integration-test/1.0', TARGET_TIMEOUT_SECONDS: '1', WORKERS: String(workers), MAX_ATTEMPTS: '3' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout?.on('data', data => { output += data; }); child.stderr?.on('data', data => { output += data; });
@@ -100,6 +100,119 @@ test('integration: transparent durable failure policies', { timeout: 60_000 }, a
     await waitFor(async () => hits.get('blocked') === 1);
     await send('auth403'); await waitFor(async () => (await metrics()).circuitOpen && (await metrics()).events.dead === 3);
     assert.equal(hits.get('auth403'), 1, '403 applies the circuit policy');
+  } finally {
+    if (gateway) await stop(gateway.child);
+    if (target) await new Promise<void>(resolve => target!.close(() => resolve()));
+    await execDocker('rm', '-f', name).catch(() => undefined);
+  }
+});
+
+test('migration: adds instance and last_latency_ms to existing schema', { timeout: 30_000 }, async (t) => {
+  try { await execDocker('version', '--format', '{{.Server.Version}}'); }
+  catch { t.skip('Docker is required for PostgreSQL migration tests'); return; }
+
+  const name = `aricrm-migration-it-${Date.now()}-${Math.floor(Math.random() * 100_000)}`;
+  const { Client } = await import('pg');
+  try {
+    await execDocker('run', '-d', '--rm', '--name', name, '-e', 'POSTGRES_DB=gateway', '-e', 'POSTGRES_USER=gateway', '-e', 'POSTGRES_PASSWORD=gateway-test-password', '-p', '127.0.0.1::5432', 'postgres:16-alpine');
+    const portLine = await execDocker('port', name, '5432/tcp');
+    const postgresPort = Number(portLine.slice(portLine.lastIndexOf(':') + 1));
+    await waitFor(async () => {
+      try { await execDocker('exec', name, 'psql', '-U', 'gateway', '-d', 'gateway', '-Atqc', 'SELECT 1'); return true; }
+      catch { return false; }
+    });
+    await sleep(500);
+    const client = new Client(`postgres://gateway:gateway-test-password@127.0.0.1:${postgresPort}/gateway`);
+    await client.connect();
+
+    // 1. Create OLD schema (without instance and last_latency_ms)
+    await client.query(`CREATE TABLE webhook_events (id BIGSERIAL PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,payload JSONB NOT NULL,state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','processing','delivered','dead')),attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),locked_at TIMESTAMPTZ,last_status INTEGER,last_error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),delivered_at TIMESTAMPTZ)`);
+    await client.query(`CREATE INDEX webhook_events_ready_idx ON webhook_events(next_attempt_at,id) WHERE state='pending'`);
+
+    // 2. Insert a row with the old schema
+    await client.query(`INSERT INTO webhook_events(event_key,payload) VALUES($1,$2)`, ['old-key', '{}']);
+
+    // 3. Run migration (same statements server.ts runs on startup)
+    await client.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS instance TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS last_latency_ms INTEGER`);
+    await client.query(`DROP INDEX IF EXISTS webhook_events_ready_idx`);
+    await client.query(`CREATE INDEX webhook_events_ready_idx ON webhook_events(instance,next_attempt_at,id) WHERE state='pending'`);
+    await client.query(`CREATE INDEX IF NOT EXISTS webhook_events_processing_idx ON webhook_events(instance) WHERE state='processing'`);
+
+    // 4. Insert a row with the new schema
+    await client.query(`INSERT INTO webhook_events(event_key,instance,payload) VALUES($1,$2,$3)`, ['new-key', 'line_test', '{}']);
+
+    // 5. Verify both rows are accessible with new columns
+    const result = await client.query<{ id: string, instance: string, last_latency_ms: number | null }>(`SELECT id::text, instance, last_latency_ms FROM webhook_events ORDER BY id`);
+    assert.equal(result.rows.length, 2);
+    assert.equal(result.rows[0]!.instance, '');           // old row gets DEFAULT ''
+    assert.equal(result.rows[0]!.last_latency_ms, null);  // old row gets NULL
+    assert.equal(result.rows[1]!.instance, 'line_test');   // new row has instance
+    assert.equal(result.rows[1]!.last_latency_ms, null);   // new row, not yet delivered
+
+    // 6. Verify UPDATE with last_latency_ms works (simulates delivery)
+    await client.query(`UPDATE webhook_events SET state='delivered',last_latency_ms=42 WHERE id=$1`, [result.rows[1]!.id]);
+    const delivered = await client.query<{ last_latency_ms: number }>(`SELECT last_latency_ms FROM webhook_events WHERE id=$1`, [result.rows[1]!.id]);
+    assert.equal(delivered.rows[0]!.last_latency_ms, 42);
+
+    await client.end();
+  } finally {
+    await execDocker('rm', '-f', name).catch(() => undefined);
+  }
+});
+
+test('concurrent: per-instance ordering with multiple workers', { timeout: 60_000 }, async (t) => {
+  try { await execDocker('version', '--format', '{{.Server.Version}}'); }
+  catch { t.skip('Docker is required for PostgreSQL concurrent tests'); return; }
+
+  const name = `aricrm-concurrent-it-${Date.now()}-${Math.floor(Math.random() * 100_000)}`;
+  let gateway: Gateway | undefined; let target: Server | undefined;
+  const deliveryOrder: string[] = [];
+  try {
+    await execDocker('run', '-d', '--rm', '--name', name, '-e', 'POSTGRES_DB=gateway', '-e', 'POSTGRES_USER=gateway', '-e', 'POSTGRES_PASSWORD=gateway-test-password', '-p', '127.0.0.1::5432', 'postgres:16-alpine');
+    const portLine = await execDocker('port', name, '5432/tcp');
+    const postgresPort = Number(portLine.slice(portLine.lastIndexOf(':') + 1));
+    await waitFor(async () => {
+      try { await execDocker('exec', name, 'psql', '-U', 'gateway', '-d', 'gateway', '-Atqc', 'SELECT 1'); return true; }
+      catch { return false; }
+    });
+    await sleep(500);
+    const databaseUrl = `postgres://gateway:gateway-test-password@127.0.0.1:${postgresPort}/gateway`;
+
+    // Target server records delivery order per instance
+    target = createServer(async (request, response) => {
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { data?: { key?: { id?: string } } };
+      const eventId = body.data?.key?.id ?? '';
+      if (eventId) deliveryOrder.push(eventId);
+      // Small delay to widen the window where parallel delivery would be detectable
+      await sleep(50);
+      response.writeHead(200).end('{}');
+    });
+    target.listen(0, '127.0.0.1'); await once(target, 'listening');
+    const targetUrl = `http://127.0.0.1:${(target.address() as { port: number }).port}`;
+
+    // Start gateway with WORKERS=2
+    gateway = await startGateway(await freePort(), databaseUrl, targetUrl);
+
+    // Send 5 events for the SAME instance with sequential key IDs
+    const instance = 'concurrent-test-line';
+    for (let i = 1; i <= 5; i++) {
+      const id = `msg-${i}`;
+      const response: Response = await fetch(`${gateway!.baseUrl}/v1/evolution`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-gateway-token': ingressToken },
+        body: JSON.stringify({ event: 'messages.upsert', instance, data: { key: { id } } }),
+      });
+      assert.equal(response.status, 200);
+    }
+
+    // Wait for all 5 events to be delivered
+    await waitFor(async () => deliveryOrder.length === 5, 20_000);
+
+    // Verify: events for the same instance were delivered in insertionF order
+    assert.deepEqual(deliveryOrder, ['msg-1', 'msg-2', 'msg-3', 'msg-4', 'msg-5'],
+      'per-instance delivery must respect insertion order even with WORKERS=2');
   } finally {
     if (gateway) await stop(gateway.child);
     if (target) await new Promise<void>(resolve => target!.close(() => resolve()));

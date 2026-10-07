@@ -29,7 +29,7 @@ const timeoutMs = integer('TARGET_TIMEOUT_SECONDS', 15) * 1000;
 const maxAttempts = integer('MAX_ATTEMPTS', 12);
 const retentionHours = integer('DELIVERED_RETENTION_HOURS', 72);
 const circuitBreakerSeconds = integer('EGRESS_CIRCUIT_BREAKER_SECONDS', 300);
-const maxResponseBytes = integer('EGRESS_MAX_RESPONSE_BYTES', 1024) * 1024;
+const maxResponseBytes = integer('EGRESS_MAX_RESPONSE_KIB', integer('EGRESS_MAX_RESPONSE_BYTES', 1024)) * 1024;
 const userAgent = required('EGRESS_USER_AGENT');
 
 const pool = new pg.Pool({
@@ -56,7 +56,7 @@ const egressConfig: EgressConfig = {
 let stopping = false;
 
 await pool.query(
-  `CREATE TABLE IF NOT EXISTS webhook_events (id BIGSERIAL PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,instance TEXT NOT NULL DEFAULT '',payload JSONB NOT NULL,state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','processing','delivered','dead')),attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),locked_at TIMESTAMPTZ,last_status INTEGER,last_error TEXT,last_latency_ms INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),delivered_at TIMESTAMPTZ); CREATE INDEX IF NOT EXISTS webhook_events_ready_idx ON webhook_events(instance,next_attempt_at,id) WHERE state='pending'; UPDATE webhook_events SET state='pending',locked_at=NULL WHERE state='processing' AND locked_at < now()-interval '5 minutes'`
+  `CREATE TABLE IF NOT EXISTS webhook_events (id BIGSERIAL PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,instance TEXT NOT NULL DEFAULT '',payload JSONB NOT NULL,state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','processing','delivered','dead')),attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),locked_at TIMESTAMPTZ,last_status INTEGER,last_error TEXT,last_latency_ms INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),delivered_at TIMESTAMPTZ); ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS instance TEXT NOT NULL DEFAULT ''; ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS last_latency_ms INTEGER; DROP INDEX IF EXISTS webhook_events_ready_idx; CREATE INDEX webhook_events_ready_idx ON webhook_events(instance,next_attempt_at,id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS webhook_events_processing_idx ON webhook_events(instance) WHERE state='processing'; UPDATE webhook_events SET state='pending',locked_at=NULL WHERE state='processing' AND locked_at < now()-interval '5 minutes'`
 );
 
 await app.register(rateLimit, {
@@ -127,8 +127,43 @@ type Event = {
 };
 
 async function claim(): Promise<Event | null> {
-
-  const result = await pool.query<Event>(`WITH candidate AS (SELECT id FROM webhook_events WHERE state='pending' AND next_attempt_at<=now() ORDER BY instance,next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE webhook_events e SET state='processing',locked_at=now(),attempts=attempts+1 FROM candidate c WHERE e.id=c.id RETURNING e.id::text,e.instance,e.payload,e.attempts`);
+  // Per-instance serial delivery:
+  // 1. NOT EXISTS(processing) — skip instances already being worked
+  // 2. NOT EXISTS(older pending) — enforce insertion-order within instance
+  // 3. pg_try_advisory_xact_lock — close the MVCC race window between workers
+  //    (hashtext is a stable PG internal hash; namespace 1 avoids collisions)
+  // LIMIT 10 candidates so we can skip instances whose advisory lock is held
+  // by another worker and still find work.
+  const result = await pool.query<Event>(`
+    WITH candidates AS (
+      SELECT e.id, e.instance
+      FROM webhook_events e
+      WHERE e.state = 'pending'
+        AND e.next_attempt_at <= now()
+        AND NOT EXISTS (
+          SELECT 1 FROM webhook_events p
+          WHERE p.instance = e.instance AND p.state = 'processing'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM webhook_events o
+          WHERE o.instance = e.instance AND o.state = 'pending' AND o.id < e.id
+        )
+      ORDER BY e.next_attempt_at, e.id
+      FOR UPDATE SKIP LOCKED
+      LIMIT 10
+    ),
+    locked AS (
+      SELECT c.id
+      FROM candidates c
+      WHERE pg_try_advisory_xact_lock(hashtext(c.instance), 1)
+      LIMIT 1
+    )
+    UPDATE webhook_events e
+    SET state = 'processing', locked_at = now(), attempts = attempts + 1
+    FROM locked l
+    WHERE e.id = l.id
+    RETURNING e.id::text, e.instance, e.payload, e.attempts
+  `);
   return result.rows[0] ?? null;
 }
 
