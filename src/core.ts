@@ -19,9 +19,17 @@ export function retryDelayMs(attempt: number, random = Math.random()): number {
   return Math.floor(seconds * (0.8 + random * 0.4) * 1000);
 }
 
-export function classifyStatus(status: number): 'delivered'|'retry'|'auth_dead'|'dead' {
+export function classifyStatus(status: number): 'delivered' | 'retry' | 'auth_dead' | 'dead' {
   if (status >= 200 && status < 300) return 'delivered';
   if (status === 401 || status === 403) return 'auth_dead';
   if (status === 429 || status >= 500) return 'retry';
   return 'dead';
+}
+
+// reason mapping lives here so egress.ts doesn't duplicate the logic.
+export function deliveryReason(kind: string, status: number | null): string {
+  if (kind === 'delivered') return 'ok';
+  if (kind === 'auth_dead') return 'target_auth_rejected';
+  if (status === null) return 'target_unreachable';
+  return 'target_error';
 }
